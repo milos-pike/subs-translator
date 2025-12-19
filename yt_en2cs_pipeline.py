@@ -1,16 +1,29 @@
 # Soubor: yt_en2cs_pipeline.py
-# Autor: Miloš Pike (VOLTPAJK)
+# Autor: Miloš Pike (VOLTPAJK) + ChatGPT ladění
 # Rok: 2025
 # Licence: MIT
 #
-# Popis:
-# - URL -> export\<název>.mp4 + <název>.en.srt + <název>.cs.srt
-# - CLI: model volíš přepínači --tiny/--base/--small/--medium/--large, zařízení --device auto|cpu|cuda
-#        progress bar přes tqdm, volba GUI: --gui
-# - GUI: jednoduché Tkinter okno (URL, model, device) + autodetekce rozumných defaultů
+# Funkce:
+# - URL -> export\<název_videa>.wav + <název_videa>.en.srt + <název_videa>.cs.srt
+# - CLI:
+#     python app\yt_en2cs_pipeline.py "<URL>" --audio-only --base --cpu -o export
+# - GUI:
+#     python app\yt_en2cs_pipeline.py --gui
+#
+# Download:
+# - yt-dlp bez explicitního -f (obchází „Requested format is not available“)
+# - v tmp složce vybere nejlepší media soubor (preferuje .webm/.mp4/.m4a/…)
+# - ffmpeg:
+#     - pro audio-only → WAV 16 kHz mono (ideální pro Whisper)
+#     - pro video → MP4 (H.264 + AAC)
 
 
-import os, re, sys, tempfile, datetime, threading, shutil
+import re
+import sys
+import tempfile
+import datetime
+import subprocess
+import threading
 from pathlib import Path
 
 import srt
@@ -21,129 +34,190 @@ from tqdm import tqdm
 import argostranslate.package as argos_pkg
 import argostranslate.translate as argos_tr
 
+
 # ---------- Defaulty ----------
 EXPORT_DIR   = Path("export")
 FROM_LANG    = "en"
 TO_LANG      = "cs"
+
+# ---------- Logger (sdílený pro CLI i GUI) ----------
+LOG_FN = None  # type: ignore[assignment]
+
+
+def set_logger(fn):
+    """Nastaví funkci pro logování (např. append z GUI)."""
+    global LOG_FN
+    LOG_FN = fn
+
+
+def log(msg: str):
+    """Obecný logger – v CLI tiskne na stdout, v GUI píše do Text widgetu."""
+    if LOG_FN is not None:
+        try:
+            LOG_FN(msg)
+        except Exception:
+            # kdyby něco selhalo v GUI, fallback na print
+            print(msg)
+    else:
+        print(msg)
+
 
 # ---------- Pomocné ----------
 def sanitize_filename(name: str) -> str:
     name = re.sub(r'[\\/:*?"<>|]+', "_", name)
     return name.strip().rstrip(".")
 
+
 def ensure_argos_en_cs():
     installed = argos_pkg.get_installed_packages()
     if any(p.from_code == FROM_LANG and p.to_code == TO_LANG for p in installed):
         return
-    print("[Argos] Stahuji a instaluji model EN->CS ...")
+    log("[Argos] Stahuji a instaluji model EN->CS ...")
     argos_pkg.update_package_index()
     available = argos_pkg.get_available_packages()
     cand = [p for p in available if p.from_code == FROM_LANG and p.to_code == TO_LANG]
     if not cand:
         raise RuntimeError("Nenalezen balíček EN->CS v indexu Argos.")
     argos_pkg.install_from_path(cand[0].download())
-    print("[Argos] Model nainstalován.")
+    log("[Argos] Model nainstalován.")
 
-def probe_title_and_duration(url: str):
-    """Získá title a duration bez stahování obsahu."""
-    opts = {"quiet": True, "no_warnings": True}
-    with YoutubeDL(opts) as y:
-        info = y.extract_info(url, download=False)
-    title = info.get("title") or "video"
-    duration = info.get("duration")
-    return title, duration
 
-def download_youtube(url: str,
-                     export_dir: Path,
-                     want_video: bool = True,
-                     on_progress=None,
-                     suppress_console_progress: bool = False) -> Path:
+# ---------- ffmpeg helpery ----------
+def run_ffmpeg(args):
+    """Spustí ffmpeg s danými argumenty, hodí RuntimeError při chybě."""
+    cmd = ["ffmpeg", "-y", "-loglevel", "error"] + args
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg selhal:\n{proc.stderr.strip()}")
+
+
+def convert_to_mp4(src: Path, dst: Path) -> Path:
+    """Překóduje libovolné video do MP4 (H.264 + AAC)."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    log(f"[FFmpeg] Převádím na MP4: {dst.name}")
+    run_ffmpeg([
+        "-i", str(src),
+        "-c:v", "libx264", "-preset", "veryfast",
+        "-c:a", "aac", "-b:a", "128k",
+        str(dst),
+    ])
+    return dst
+
+
+def convert_to_audio(src: Path, dst: Path) -> Path:
+    """Vytáhne audio stopu a překonvertuje ji do WAV (16 kHz mono) – ideál pro Whisper."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    log(f"[FFmpeg] Vytahuji audio do WAV: {dst.name}")
+    run_ffmpeg([
+        "-i", str(src),
+        "-vn",                # bez videa
+        "-ac", "1",           # mono
+        "-ar", "16000",       # 16 kHz
+        "-c:a", "pcm_s16le",  # nekomprimované WAV
+        str(dst),
+    ])
+    return dst
+
+
+PREFERRED_EXTS = [".webm", ".mp4", ".m4a", ".mkv", ".mp3", ".opus", ".ogg", ".wav"]
+
+
+def pick_best_media_file(tmp_dir: Path) -> Path:
+    """
+    Z dočasné složky vybere nejlepší mediální soubor:
+    - ignoruje .mhtml, .html, obrázky, json, apod.
+    - preferuje přípony v PREFERRED_EXTS
+    - pro stejnou příponu bere největší soubor (nejvyšší bitrate)
+    """
+    candidates: list[Path] = []
+    for p in tmp_dir.iterdir():
+        if not p.is_file():
+            continue
+        ext = p.suffix.lower()
+        if ext in (".mhtml", ".html", ".htm", ".txt", ".json", ".js",
+                   ".jpg", ".jpeg", ".png", ".webp", ".gif"):
+            continue
+        candidates.append(p)
+
+    if not candidates:
+        raise RuntimeError("YT: nepodařilo se najít žádný mediální soubor po stažení.")
+
+    def pref_index(ext: str) -> int:
+        ext = ext.lower()
+        return PREFERRED_EXTS.index(ext) if ext in PREFERRED_EXTS else len(PREFERRED_EXTS)
+
+    # seřadíme: nejdřív podle preference přípony, pak podle velikosti (větší = lepší)
+    candidates.sort(key=lambda p: (pref_index(p.suffix), -p.stat().st_size))
+    best = candidates[0]
+    log(f"[YT] Vybraný stažený soubor: {best.name} (ext={best.suffix}, size={best.stat().st_size} B)")
+    return best
+
+
+def download_youtube(url: str, export_dir: Path, want_video: bool = True) -> Path:
+    """
+    Stáhne YouTube obsah do dočasné složky pomocí yt-dlp bez explicitního 'format'
+    (tím obcházíme „Requested format is not available“),
+    vybere nejlepší mediální soubor a zpracuje ho ffmpegem:
+
+      - pokud want_video=True  → <export_dir>/<název>.mp4 (H.264 + AAC)
+      - pokud want_video=False → <export_dir>/<název>.wav (16 kHz mono pro Whisper)
+
+    Vrací cestu k výslednému souboru.
+    """
     export_dir.mkdir(parents=True, exist_ok=True)
-    title, _ = probe_title_and_duration(url)
-    base  = sanitize_filename(title)
 
-    def _hook(d):
-        if on_progress is None:
-            return
-        try:
-            if d.get("status") == "downloading":
-                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-                done  = d.get("downloaded_bytes") or 0
-                if total:
-                    on_progress(min(100.0, 100.0 * done / total))
-            elif d.get("status") == "finished":
-                on_progress(100.0)
-        except Exception:
-            pass
+    with tempfile.TemporaryDirectory() as td:
+        tmp_dir = Path(td)
+        outtmpl = str(tmp_dir / "video.%(ext)s")
 
-    common_opts = {
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "progress_hooks": [_hook] if on_progress else [],
-    }
-    if suppress_console_progress:
-        common_opts["noprogress"] = True
-
-    if want_video:
-        outtmpl = str(export_dir / f"{base}.%(ext)s")
         ydl_opts = {
-            **common_opts,
-            "format": "bestvideo+bestaudio/best",
-            "merge_output_format": "mp4",
             "outtmpl": outtmpl,
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "config_locations": [],  # ignoruj globální yt-dlp config
         }
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            # preferovaná cesta:
-            merged = export_dir / f"{base}.mp4"
-            if merged.exists():
-                return merged
-            # fallback
-            pf = Path(ydl.prepare_filename(info)).with_suffix(".mp4")
-            if pf.exists():
-                return pf
-            cand = list(export_dir.glob(f"{base}*.mp4"))
-            if cand:
-                return cand[0]
-            raise RuntimeError("Nepodařilo se najít stažené MP4.")
-    else:
-        with tempfile.TemporaryDirectory() as td:
-            tmp_dir = Path(td)
-            outtmpl = str(tmp_dir / f"{base}.%(ext)s")
-            ydl_opts = {
-                **common_opts,
-                "format": "bestaudio/best",
-                "outtmpl": outtmpl,
-            }
-            with YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                # najdi audio soubor
-                for p in tmp_dir.iterdir():
-                    if p.suffix.lower() in (".m4a", ".webm", ".opus", ".mp3"):
-                        # přesun do exportu kvůli jednotnému umístění
-                        target = export_dir / p.name
-                        shutil.move(str(p), target)
-                        return target
-            raise RuntimeError("Audio se nestáhlo.")
 
-def transcribe_to_srt(media_path: Path, srt_out: Path,
-                      model_name: str = "small.en",
-                      device: str = "auto",
-                      compute_type: str = "auto",
-                      duration_sec: float | None = None,
-                      on_progress=None):
-    print(f"[FW] Načítám model: {model_name} (device={device}, compute_type={compute_type})")
+        with YoutubeDL(ydl_opts) as ydl:
+            log("[YT-dlp] Stahuji přes yt-dlp (bez explicitního formátu)...")
+            info = ydl.extract_info(url, download=True)
+
+        # název videa pro pojmenování výstupů
+        title = info.get("title") or "video"
+        base = sanitize_filename(title)
+
+        # najdeme nejlepší soubor v tmp_dir
+        src = pick_best_media_file(tmp_dir)
+
+        if want_video:
+            dst = export_dir / f"{base}.mp4"
+            log(f"[YT] Konvertuji video do MP4: {dst.name}")
+            return convert_to_mp4(src, dst)
+        else:
+            dst = export_dir / f"{base}.wav"
+            log(f"[YT] Vytahuji audio pro Whisper: {dst.name}")
+            return convert_to_audio(src, dst)
+
+
+# ---------- Whisper + Argos ----------
+def transcribe_to_srt(
+    media_path: Path,
+    srt_out: Path,
+    model_name: str = "small.en",
+    device: str = "auto",
+    compute_type: str = "auto",
+    duration_sec: float | None = None
+):
+    """Přepis do EN SRT."""
+    log(f"[FW] Načítám model: {model_name} (device={device}, compute_type={compute_type})")
     model = WhisperModel(model_name, device=device, compute_type=compute_type)
 
-    print(f"[FW] Přepisuji: {media_path}")
-    use_gui_progress = callable(on_progress) and duration_sec and duration_sec > 0
-
+    log(f"[FW] Přepisuji: {media_path}")
+    # v GUI nechceme tqdm progress bar – bude se zobrazovat jen v konzoli
+    use_tqdm = (LOG_FN is None)
     pbar = None
     last = 0.0
-    if use_gui_progress:
-        on_progress(0.0)
-    elif duration_sec and duration_sec > 0:
+    if duration_sec and duration_sec > 0 and use_tqdm:
         pbar = tqdm(total=duration_sec, unit="s", desc="Přepis", ncols=80)
 
     segments, info = model.transcribe(
@@ -155,6 +229,7 @@ def transcribe_to_srt(media_path: Path, srt_out: Path,
     )
 
     subs = []
+    next_log_t = 60.0  # v GUI pošleme info každou cca minutu audio času
     for i, seg in enumerate(segments, 1):
         subs.append(
             srt.Subtitle(
@@ -164,13 +239,16 @@ def transcribe_to_srt(media_path: Path, srt_out: Path,
                 content=seg.text.strip()
             )
         )
-        if use_gui_progress and duration_sec:
-            last = float(seg.end)
-            on_progress(min(100.0, 100.0 * last / float(duration_sec)))
-        elif pbar:
+        if pbar:
             inc = max(0.0, float(seg.end) - last)
             pbar.update(inc)
             last = float(seg.end)
+
+        # jednoduchý heartbeat pro GUI – ať je vidět, že to žije
+        if LOG_FN is not None:
+            if float(seg.end) >= next_log_t:
+                log(f"[FW] Přepsáno minimálně {int(seg.end)} s audio...")
+                next_log_t += 60.0
 
     if pbar:
         pbar.n = pbar.total
@@ -180,14 +258,17 @@ def transcribe_to_srt(media_path: Path, srt_out: Path,
     srt_out.parent.mkdir(parents=True, exist_ok=True)
     with open(srt_out, "w", encoding="utf-8") as f:
         f.write(srt.compose(subs))
-    print(f"[FW] Uloženo: {srt_out}")
+    log(f"[FW] Uloženo: {srt_out}")
+
 
 def translate_srt_en2cs(srt_in: Path, srt_out: Path):
+    log("[Argos] Kontroluji EN->CS model...")
     ensure_argos_en_cs()
     with open(srt_in, "r", encoding="utf-8", errors="ignore") as f:
         en_text = f.read()
     subs = list(srt.parse(en_text))
 
+    log("[Argos] Překládám titulky EN→CS...")
     out_subs = []
     for sub in subs:
         cz = argos_tr.translate(sub.content, FROM_LANG, TO_LANG).strip()
@@ -198,45 +279,32 @@ def translate_srt_en2cs(srt_in: Path, srt_out: Path):
     srt_out.parent.mkdir(parents=True, exist_ok=True)
     with open(srt_out, "w", encoding="utf-8") as f:
         f.write(srt.compose(out_subs))
-    print(f"[Argos] Uloženo: {srt_out}")
+    log(f"[Argos] Uloženo: {srt_out}")
 
-# ---------- CLI ----------
+
+# ---------- CLI pipeline ----------
 def run_pipeline(url: str, export_dir: Path, model_name: str,
-                 device: str, compute_type: str, want_video: bool,
-                 on_dl_progress=None, on_tr_progress=None,
-                 suppress_console_progress=False):
-    title, duration = probe_title_and_duration(url)
-    safe = sanitize_filename(title)
+                 device: str, compute_type: str, want_video: bool):
+    duration = None  # bez metadat – progress bar bude jen podle segmentů
+    log(f"[YT] Stahuji {'video' if want_video else 'audio'} z URL: {url}")
+    media_path = download_youtube(url, export_dir, want_video=want_video)
+    base = media_path.stem
 
-    # download (video.mp4 nebo audio.*)
-    print(f"[YT] Stahuji {'video' if want_video else 'audio'} z URL: {url}")
-    media_path = download_youtube(
-        url, export_dir, want_video=want_video,
-        on_progress=on_dl_progress,
-        suppress_console_progress=suppress_console_progress
-    )
-    base = media_path.stem  # název bez přípony
-
-    # sjednocení názvu SRT vedle média:
     srt_en = export_dir / f"{base}.en.srt"
     srt_cs = export_dir / f"{base}.cs.srt"
 
-    # transcribe
-    transcribe_to_srt(
-        media_path, srt_en, model_name, device, compute_type, duration,
-        on_progress=on_tr_progress
-    )
-
-    # translate
+    transcribe_to_srt(media_path, srt_en, model_name, device, compute_type, duration)
     translate_srt_en2cs(srt_en, srt_cs)
 
-    print("\n[OK] Hotovo.")
+    log("\n[OK] Hotovo.")
     if media_path.suffix.lower() == ".mp4":
-        print(f"     Video:      {media_path}")
-    print(f"     EN titulky: {srt_en}")
-    print(f"     CZ titulky: {srt_cs}")
+        log(f"     Video:      {media_path}")
+    log(f"     EN titulky: {srt_en}")
+    log(f"     CZ titulky: {srt_cs}")
+
 
 def parse_args(argv):
+    # jednoduchý parser s podporou GUI
     args = {
         "url": None,
         "export": EXPORT_DIR,
@@ -253,12 +321,12 @@ def parse_args(argv):
         args["gui"] = True
         return args
 
-    # URL 
+    # URL (první ne-flag argument)
     nonflags = [a for a in argv[1:] if not a.startswith("-")]
     if nonflags:
         args["url"] = nonflags[0]
 
-    # model přepínače 
+    # model
     if "--tiny" in flags:   args["model"] = "tiny.en"
     if "--base" in flags:   args["model"] = "base.en"
     if "--small" in flags:  args["model"] = "small.en"
@@ -270,7 +338,7 @@ def parse_args(argv):
     if "--cuda" in flags:   args["device"] = "cuda"
     if "--auto" in flags:   args["device"] = "auto"
 
-    # compute type 
+    # compute type
     if "--int8" in flags:           args["compute"] = "int8"
     if "--int8-fp16" in flags:      args["compute"] = "int8_float16"
     if "--fp16" in flags or "--f16" in flags: args["compute"] = "float16"
@@ -286,6 +354,7 @@ def parse_args(argv):
 
     return args
 
+
 # ---------- GUI ----------
 def autodetect_defaults():
     model = "small.en"
@@ -299,10 +368,10 @@ def autodetect_defaults():
         pass
     return model, device
 
+
 def run_gui():
     import tkinter as tk
     from tkinter import ttk, messagebox
-    import threading, sys
 
     root = tk.Tk()
     root.title("YT video → EN/CZ titulky  |   Miloš Pike (VOLTPAJK)")
@@ -321,13 +390,12 @@ def run_gui():
 
     ttk.Label(frm, text="YouTube URL:").grid(row=0, column=0, sticky="w")
     url_entry = ttk.Entry(frm, textvariable=url_var, width=70)
-    url_entry.grid(row=0, column=1, columnspan=5, sticky="ew", padx=(6,0))
-    frm.grid_columnconfigure(5, weight=1)
+    url_entry.grid(row=0, column=1, columnspan=3, sticky="ew", padx=(6, 0))
 
     # Modely – vlastní rámec
-    ttk.Label(frm, text="Model:").grid(row=1, column=0, sticky="w", pady=(8,0))
+    ttk.Label(frm, text="Model:").grid(row=1, column=0, sticky="w", pady=(8, 0))
     models_frm = ttk.Frame(frm)
-    models_frm.grid(row=1, column=1, columnspan=5, sticky="w", pady=(8,0))
+    models_frm.grid(row=1, column=1, columnspan=5, sticky="w", pady=(8, 0))
 
     for i, (label, val) in enumerate([
         ("tiny", "tiny.en"),
@@ -336,84 +404,26 @@ def run_gui():
         ("medium", "medium"),
         ("large", "large-v2"),
     ]):
-        ttk.Radiobutton(models_frm, text=label, value=val, variable=model_var)\
+        ttk.Radiobutton(models_frm, text=label, value=val, variable=model_var) \
             .grid(row=0, column=i, sticky="w", padx=6)
 
-    # Zařízení
-    ttk.Label(frm, text="Zařízení:").grid(row=2, column=0, sticky="w", pady=(8,0))
-    for i, (label, val) in enumerate([("auto","auto"), ("CPU","cpu"), ("CUDA","cuda")]):
-        ttk.Radiobutton(frm, text=label, value=val, variable=device_var)\
-            .grid(row=2, column=1+i, sticky="w", padx=4, pady=(8,0))
+    ttk.Label(frm, text="Zařízení:").grid(row=2, column=0, sticky="w", pady=(8, 0))
+    for i, (label, val) in enumerate([("auto", "auto"), ("CPU", "cpu"), ("CUDA", "cuda")]):
+        ttk.Radiobutton(frm, text=label, value=val, variable=device_var) \
+            .grid(row=2, column=1 + i, sticky="w", padx=4, pady=(8, 0))
 
-    ttk.Checkbutton(frm, text="Stáhnout celé video (MP4)", variable=video_var)\
-        .grid(row=3, column=0, columnspan=2, sticky="w", pady=(8,0))
+    ttk.Checkbutton(frm, text="Stáhnout celé video (MP4)", variable=video_var) \
+        .grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
-    # Progress bary
-    ttk.Label(frm, text="Stahování:").grid(row=4, column=0, sticky="w", pady=(8,0))
-    dl_pb = ttk.Progressbar(frm, mode="determinate", length=400, maximum=100)
-    dl_pb.grid(row=4, column=1, columnspan=5, sticky="w", pady=(8,0))
-
-    ttk.Label(frm, text="Přepis:").grid(row=5, column=0, sticky="w", pady=(4,0))
-    tr_pb = ttk.Progressbar(frm, mode="determinate", length=400, maximum=100)
-    tr_pb.grid(row=5, column=1, columnspan=5, sticky="w", pady=(4,0))
-
-    # Log okno
-    log = tk.Text(frm, height=12, width=90)
-    log.grid(row=6, column=0, columnspan=6, sticky="nsew", pady=(8,0))
-    frm.rowconfigure(6, weight=1)
+    log_txt = tk.Text(frm, height=16, width=90)
+    log_txt.grid(row=4, column=0, columnspan=5, sticky="nsew", pady=(8, 0))
+    frm.rowconfigure(4, weight=1)
     frm.columnconfigure(3, weight=1)
 
-    def log_line(msg: str):
-        msg = msg.strip()
-        if not msg:
-            return
-        log.insert("end", msg + "\n")
-        log.see("end")
-
-    # GUI sink – filtr
-    class CleanGuiSink:
-        noisy_prefixes = (
-            "[download]", "Přepis:",
-            "vocabulary.txt", "tokenizer.json", "config.json", "model.bin",
-        )
-        def write(self, s: str):
-            s = s.replace("\r", "")
-            if "FutureWarning" in s and "stanza" in s:
-                return
-            if any(s.lstrip().startswith(p) for p in self.noisy_prefixes):
-                return
-            if s.strip():
-                log.after(0, log_line, s)
-        def flush(self): pass
-
-    # konzole + GUI
-    class Tee:
-        def __init__(self, *streams):
-            self.streams = streams
-        def write(self, s):
-            for st in self.streams:
-                try:
-                    st.write(s)
-                except Exception:
-                    pass
-        def flush(self):
-            for st in self.streams:
-                try:
-                    st.flush()
-                except Exception:
-                    pass
-
-    # Zapoj duální výstup: původní konzole + čistý GUI sink
-    sys_stdout_orig, sys_stderr_orig = sys.stdout, sys.stderr
-    gui_sink = CleanGuiSink()
-    sys.stdout = Tee(sys_stdout_orig, gui_sink)
-    sys.stderr = Tee(sys_stderr_orig, gui_sink)
-
-    # GUI callbacky pro progress 
-    def on_dl_progress(pct: float):
-        dl_pb["value"] = pct
-    def on_tr_progress(pct: float):
-        tr_pb["value"] = pct
+    def append(msg: str):
+        log_txt.insert("end", msg + "\n")
+        log_txt.see("end")
+        root.update_idletasks()
 
     def run_job():
         url = url_var.get().strip()
@@ -421,7 +431,9 @@ def run_gui():
             messagebox.showerror("Chyba", "Zadej YouTube URL.")
             return
         try:
-            print("[Start] Zpracovávám…")
+            # nasměrujeme globální logger do GUI
+            set_logger(append)
+            append("[Start] Zpracovávám…")
             run_pipeline(
                 url=url,
                 export_dir=EXPORT_DIR,
@@ -429,43 +441,48 @@ def run_gui():
                 device=device_var.get(),
                 compute_type="auto",
                 want_video=video_var.get(),
-                on_dl_progress=lambda p: root.after(0, on_dl_progress, p),
-                on_tr_progress=lambda p: root.after(0, on_tr_progress, p),
-                suppress_console_progress=False,
             )
-            print("[OK] Hotovo. Výstup v ./export")
-            dl_pb["value"] = 100
-            tr_pb["value"] = 100
+            append("[OK] Hotovo. Výstup v ./export")
         except Exception as e:
-            print(f"[Error] {e}")
+            append(f"[Error] {e}")
             messagebox.showerror("Chyba", str(e))
+        finally:
+            # po doběhnutí můžeme logger nechat, ať další běh jde taky do GUI
+            pass
 
     def on_start():
         threading.Thread(target=run_job, daemon=True).start()
 
     btn = ttk.Button(frm, text="Start", command=on_start)
-    btn.grid(row=7, column=0, sticky="w", pady=(8,0))
+    btn.grid(row=5, column=0, sticky="w", pady=(8, 0))
 
     root.mainloop()
+
 
 # ---------- main ----------
 if __name__ == "__main__":
     args = parse_args(sys.argv)
-    if args["gui"]:
+
+    # GUI režim
+    if args.get("gui"):
         run_gui()
         sys.exit(0)
 
+    # CLI režim – logger necháme jako print
     if not args["url"]:
-        print("Použití:\n  python app\\yt_en2cs_pipeline.py <YouTube_URL> [volby]\n"
+        print("Použití:\n"
+              "  python app\\yt_en2cs_pipeline_funkcni.py <YouTube_URL> [volby]\n"
               "Volby modelu: --tiny | --base | --small | --medium | --large\n"
-              "Zařízení: --cpu | --cuda | --auto (výchozí)\n"
+              "Zařízení:     --cpu | --cuda | --auto (výchozí)\n"
               "Výstupní složka: --export <cesta> nebo -o <cesta>\n"
               "Jen audio (rychlejší, menší): --audio-only\n"
               "GUI mód: --gui nebo -g\n"
-              "Příklad:\n  python app\\yt_en2cs_pipeline.py \"https://youtu.be/…\" --base --cpu -o export")
+              "Příklad:\n"
+              "  python app\\yt_en2cs_pipeline_funkcni.py "
+              "\"https://youtu.be/...\" --base --cpu -o export")
         sys.exit(1)
 
-    # CLI režim – nic se nemění, progressy (tqdm) zůstávají v konzoli
+    # CLI běh
     run_pipeline(
         url=args["url"],
         export_dir=args["export"],
@@ -473,7 +490,4 @@ if __name__ == "__main__":
         device=args["device"],
         compute_type=args["compute"],
         want_video=args["video"],
-        on_dl_progress=None,            # v CLI nepoužíváme GUI progress
-        on_tr_progress=None,
-        suppress_console_progress=False # v CLI necháme default výstupy
     )

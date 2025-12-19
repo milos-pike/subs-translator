@@ -5,7 +5,8 @@
 2) přepíše mluvené slovo do **anglických titulků .srt** (faster-whisper),
 3) **offline** přeloží titulky do **češtiny .srt** (Argos Translate),
 4) vše uloží do složky `export/` jako:
-   - `<název>.mp4`  (pokud stahuješ celé video)
+   - `<název>.mp4`    (pokud stahuješ celé video – bez `--audio-only`)
+   - `<název>.wav`    (pokud používáš `--audio-only` – interní audio pro přepis)
    - `<název>.en.srt` (anglické titulky)
    - `<název>.cs.srt` (české titulky)
 
@@ -145,11 +146,13 @@ Copyright (c) 2025 [Milos PIke]
 - [whisper-ctranslate2](https://pypi.org/project/whisper-ctranslate2/)  
   Licence: [MIT](https://github.com/jordimas/whisper-ctranslate2/blob/master/LICENSE)  
   Autor: Jordi Mas  
-  Zdrojový kód: https://github.com/jordimas/whisper-ctranslate2
+  Zdrojový kód: https://github.com/jordimas/whisper-ctranslate2  
+  Poznámka: v aktuální verzi skriptu se přímo nepoužívá, sloužil hlavně jako inspirace.
 
 - [Argos Translate](https://pypi.org/project/argostranslate/)  
   Licence: [MIT / CC0](https://github.com/argosopentech/argos-translate/blob/master/LICENSE)  
   Autor: Argos Open Technologies, LLC  
   Zdrojový kód: https://github.com/argosopentech/argos-translate
+
 
 
