@@ -54,8 +54,7 @@ D:\Projects\subs-translator\
 │  README.md  
 │  
 ├─ venv\  
-└─ app\  
-   └─ yt_en2cs_pipeline.py  
+└─ yt_en2cs_pipeline.py  
 
 ```
 
@@ -153,6 +152,7 @@ Copyright (c) 2025 [Milos PIke]
   Licence: [MIT / CC0](https://github.com/argosopentech/argos-translate/blob/master/LICENSE)  
   Autor: Argos Open Technologies, LLC  
   Zdrojový kód: https://github.com/argosopentech/argos-translate
+
 
 
 
