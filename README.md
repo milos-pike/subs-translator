@@ -63,7 +63,7 @@ D:\Projects\subs-translator\
 `venv\Scripts\activate.bat`
 
 Základní použití (stáhne video MP4, udělá EN i CZ titulky):
-python app\yt_en2cs_pipeline.py "https://youtu.be/…"
+python yt_en2cs_pipeline.py "https://youtu.be/…"
 
 ## Přepínače
 
@@ -86,16 +86,16 @@ python app\yt_en2cs_pipeline.py "https://youtu.be/…"
 
 ## Příklady:
 - nejrychlejší přepis (tiny), jen audio:  
-`python app\yt_en2cs_pipeline.py "https://youtu.be/…" --tiny --audio-only`  
+`python yt_en2cs_pipeline.py "https://youtu.be/…" --tiny --audio-only`  
 
 - rychlejší CPU přepis (base), stáhnout celé video:  
-`python app\yt_en2cs_pipeline.py "https://youtu.be/…" --base --cpu`  
+`python yt_en2cs_pipeline.py "https://youtu.be/…" --base --cpu`  
 
 - GPU (pokud máš CUDA a Torch CUDA nainstalován):  
-`python app\yt_en2cs_pipeline.py "https://youtu.be/…" --small --cuda`  
+`python yt_en2cs_pipeline.py "https://youtu.be/…" --small --cuda`  
 
 - GUI režim:  
-`python app\yt_en2cs_pipeline.py --gui`  
+`python yt_en2cs_pipeline.py --gui`  
 
 ---
 
@@ -152,6 +152,7 @@ Copyright (c) 2025 [Milos PIke]
   Licence: [MIT / CC0](https://github.com/argosopentech/argos-translate/blob/master/LICENSE)  
   Autor: Argos Open Technologies, LLC  
   Zdrojový kód: https://github.com/argosopentech/argos-translate
+
 
 
 
